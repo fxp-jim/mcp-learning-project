@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import readline from "node:readline/promises"; // Use the promised-based version
 
 type GitHubToolResult = {
     content: {
@@ -14,7 +15,6 @@ async function main() {
     const serverScriptPath = process.argv[2];
     if (!serverScriptPath) {
         console.error("Error: Please provide the path to the server script.");
-        console.error("Usage: node build/client.js <path_to_server_script>");
         process.exit(1);
     }
 
@@ -30,47 +30,62 @@ async function main() {
         version: "0.1.0",
     });
 
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+
     try {
         // 4. Connect to the server
         await client.connect(transport);
         console.log("Client connected successfully to the server!");
-        console.log("\nDiscovering available tools...");
-        const { tools } = await client.listTools();
+        // This loop will run forever until the user types 'quit'
+        while (true) {
+            const owner = await rl.question("\nEnter GitHub repository owner (or 'quit' to exit): ");
+            if (owner.toLowerCase() === 'quit') break;
 
-        if (tools.length ===0) {
-            console.log("Server has no tools available.");
-        } else {
-            console.log("Server has the following tools:");
-            for (const tool of tools) {
-                console.log(`- ${tool.name}: ${tool.description}`);
-            };
+            const repo = await rl.question("Enter GitHub repository name: ");
 
-            console.log("\nCalling the 'get_issue_details' tool...");
-            const toolResult = (await client.callTool({
-                name: "get_issue_details",
-                arguments: {
-                    owner: "microsoft",
-                    repo: "vscode",
-                    issue_number: 1, // Let's get the details for the very first issue!
-                },
-            })) as GitHubToolResult;
+            const action = await rl.question("Action: (1) List open issues, (2) Get issue details: ");
 
-            // The result's content is an array, we'll get the first item
-            const firstContentBlock = toolResult.content[0];
+            if (action === "1") {
+                console.log(`\nFetching issues for ${owner}/${repo}...`);
+                const result = (await client.callTool({
+                    name: "list_open_issues",
+                    arguments: { owner, repo },
+                })) as GitHubToolResult;
+                
+                console.log("\n--- Result ---");
+                console.log(result.content[0].text);
+                console.log("----------------");
+            } else if (action === "2") {
+                const issueNumberStr = await rl.question("Enter the issue number: ");
+                const issue_number = parseInt(issueNumberStr, 10);
 
-            if (firstContentBlock.type === "text") {
-                console.log("\n--- Tool Result ---");
-                console.log(firstContentBlock.text);
-                console.log("--------------------");
+                if (isNaN(issue_number)) {
+                    console.error("Invalid number. Please try again.");
+                    continue; // Skip to the next loop iteration
+                }
+
+                console.log(`\nFetching details for the issue #${issue_number}...`);
+                const result = (await client.callTool({
+                    name: "get_issue_details",
+                    arguments: { owner, repo, issue_number },
+                })) as GitHubToolResult;
+
+                console.log("\n--- Result ---");
+                console.log(result.content[0].text);
+                console.log("----------------");
+            } else {
+                console.log("Invalid action. Please enter 1 or 2.");
             }
         }
-
-        // We will add more logic here soon...
     } catch (error) {
         console.error("An error occurred:", error);
     } finally {
         // 5. Always ensure we close the connection gracefully
         console.log("Closing connection...");
+        rl.close(); // Close the readline interface
         await client.close();
     }
 }
