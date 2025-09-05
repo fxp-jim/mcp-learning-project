@@ -1,6 +1,21 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import * as fs from 'node:fs';
+import dotenv from 'dotenv';
+
+try {
+    if (fs.existsSync('.env')) {
+        const envFileContent = fs.readFileSync('.env');
+        const envConfig = dotenv.parse(envFileContent);
+        for (const key in envConfig) {
+            process.env[key] = envConfig[key];
+        }
+        console.error('Successfully loaded environment variables from .env file.');
+    }
+} catch (e) {
+    console.error('Failed to load or parse .env file:', e);
+}
 
 // Define the structure of a GitHub issue from the API
 interface GitHubIssue {
@@ -11,7 +26,25 @@ interface GitHubIssue {
     };
     html_url: string;
     body: string | null;
-}
+};
+
+interface FileMakerLoginResponse {
+    response: {
+        token: string;
+    };
+};
+
+interface FileMakerFindResponse {
+    response: {
+        data: {
+            fieldData: {
+                "hours planned": number;
+                "hours actual": number;
+                "hours remaining": number;
+            };
+        }[];
+    };
+};
 
 // 1. Create the server instance
 const server = new McpServer ({
@@ -153,6 +186,139 @@ server.registerTool(
       };
     }
   }
+);
+
+server.registerTool(
+    "get_resource_plan",
+    {
+        title: "Get User Resource Plan",
+        description: "Fetches the weekly resource plan for a user.",
+        inputSchema: {
+            user_name: z.string().describe("The name of the user to lookup."),
+            date_range: z.string().describe("The week to get the plan for (e.g. 'this week')."),
+        },
+    },
+
+    // Implementation Handler
+    async ({ user_name, date_range }) => {
+        let sessionToken: string | null = null;
+        const FM_HOST = process.env.FM_HOST;
+        const FM_DB = process.env.FM_DB;
+        const FM_USER = process.env.FM_USER;
+        const FM_PASS = process.env.FM_PASS;
+        const FM_LAYOUT = process.env.FM_LAYOUT;
+        
+        const apiLogInUrl = `https://${FM_HOST}/fmi/data/vLatest/databases/${FM_DB}/sessions`;
+        const apiPerformFindUrl = `https://${FM_HOST}/fmi/data/vLatest/databases/${FM_DB}/layouts/${FM_LAYOUT}/_find`;
+
+        try {
+            // 1. Check if credentials are provided
+            if (!FM_USER || !FM_PASS) {
+                throw new Error("FileMakaer username or password not set in the .env file.");
+            }
+
+            // 2. Create and encode credentials for Basic auth
+            const credentials = `${FM_USER}:${FM_PASS}`;
+            const encodedCredentials = Buffer.from(credentials).toString('base64');
+
+            // 3. Make the login request
+            const loginResponse = await fetch(apiLogInUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Basic ${encodedCredentials}`,
+                },
+                body: JSON.stringify({}) // FileMaker requires an empty JSON object in the body
+            });
+
+            if (!loginResponse.ok) {
+                throw new Error(`FileMaker login failed with status ${loginResponse.status}`);
+            }
+
+            // Parse the JSON from the response
+            const loginData = await loginResponse.json() as FileMakerLoginResponse;
+            
+            // Extract the token and store it
+            sessionToken = loginData.response.token;
+
+            console.error(`Successfully logged in. Session token: ${sessionToken}`);
+
+            // 4. Make Find Request
+            const findBody = {
+                    "query": [
+                        {"resource plan item__PARTY_employee::display name": `=${user_name}`}
+                    ]
+            };
+
+            console.error('Sending FileMaker Find Request Body:', JSON.stringify(findBody, null, 2));
+            
+            const findResponse = await fetch(apiPerformFindUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${sessionToken}`,
+                },
+                body: JSON.stringify(findBody)
+            });
+
+            if (!findResponse.ok) {
+                throw new Error(`FileMaker perform find failed with status ${findResponse.status}`);
+            }
+
+            const findData = await findResponse.json() as FileMakerFindResponse;
+
+            console.error('Received FileMaker Find Response:', JSON.stringify(findData, null, 2));
+
+            const records = findData.response.data;
+
+            if (!records || records.length === 0) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `No resource plan found for ${user_name} for ${date_range}`
+                    }],
+                };
+            }
+
+            const formattedPlan = records.map(record => {
+                const hoursPlanned = record.fieldData["hours planned"] || 0;
+                const hoursActual = record.fieldData["hours actual"] || 0;
+                const hoursRemaining = record.fieldData["hours remaining"] || 0;
+                return `Planned: ${hoursPlanned}\nActual: ${hoursActual}\nRemaining: ${hoursRemaining}`;
+            }).join('\n');
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Successfully logged into FileMaker! Session Token: ${sessionToken}\n\nResource plan for ${user_name} for ${date_range}:\n\n${formattedPlan}`,
+                }],
+            };
+
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : "An unknown error ocurred.";
+            return {
+                isError: true,
+                content: [{
+                    type: "text",
+                    text: `Error: ${errorMessage}`
+                }],
+            };
+        } finally {
+            // Log Out of theSession
+            const logoutResponse = await fetch(`${apiLogInUrl}/${sessionToken}`, {
+                method: "DELETE",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({}) // FileMaker requires an empty JSON object in the body
+            });
+
+            if (!logoutResponse.ok) {
+                throw new Error(`FileMaker logout failed with status ${logoutResponse.status}`);
+            }            
+            console.error("FileMaker session terminated.");
+        }
+    }
 );
 
 // This is our main function that runs the server
